@@ -1,0 +1,271 @@
+1 /*
+  2  * Supplementary group IDs
+  3  */
+  4 #include <linux/cred.h>
+  5 #include <linux/export.h>
+  6 #include <linux/slab.h>
+  7 #include <linux/security.h>
+  8 #include <linux/syscalls.h>
+  9 #include <asm/uaccess.h>
+ 10 
+ 11 /* init to 2 - one for init_task, one to ensure it is never freed */
+ 12 struct group_info init_groups = { .usage = ATOMIC_INIT(2) };
+ 13 
+ 14 struct group_info *groups_alloc(int gidsetsize)
+ 15 {
+ 16         struct group_info *group_info;
+ 17         int nblocks;
+ 18         int i;
+ 19 
+ 20         nblocks = (gidsetsize + NGROUPS_PER_BLOCK - 1) / NGROUPS_PER_BLOCK;
+ 21         /* Make sure we always allocate at least one indirect block pointer */
+ 22         nblocks = nblocks ? : 1;
+ 23         group_info = kmalloc(sizeof(*group_info) + nblocks*sizeof(gid_t *), GFP_USER);
+ 24         if (!group_info)
+ 25                 return NULL;
+ 26         group_info->ngroups = gidsetsize;
+ 27         group_info->nblocks = nblocks;
+ 28         atomic_set(&group_info->usage, 1);
+ 29 
+ 30         if (gidsetsize <= NGROUPS_SMALL)
+ 31                 group_info->blocks[0] = group_info->small_block;
+ 32         else {
+ 33                 for (i = 0; i < nblocks; i++) {
+ 34                         kgid_t *b;
+ 35                         b = (void *)__get_free_page(GFP_USER);
+ 36                         if (!b)
+ 37                                 goto out_undo_partial_alloc;
+ 38                         group_info->blocks[i] = b;
+ 39                 }
+ 40         }
+ 41         return group_info;
+ 42 
+ 43 out_undo_partial_alloc:
+ 44         while (--i >= 0) {
+ 45                 free_page((unsigned long)group_info->blocks[i]);
+ 46         }
+ 47         kfree(group_info);
+ 48         return NULL;
+ 49 }
+ 50 
+ 51 EXPORT_SYMBOL(groups_alloc);
+ 52 
+ 53 void groups_free(struct group_info *group_info)
+ 54 {
+ 55         if (group_info->blocks[0] != group_info->small_block) {
+ 56                 int i;
+ 57                 for (i = 0; i < group_info->nblocks; i++)
+ 58                         free_page((unsigned long)group_info->blocks[i]);
+ 59         }
+ 60         kfree(group_info);
+ 61 }
+ 62 
+ 63 EXPORT_SYMBOL(groups_free);
+ 64 
+ 65 /* export the group_info to a user-space array */
+ 66 static int groups_to_user(gid_t __user *grouplist,
+ 67                           const struct group_info *group_info)
+ 68 {
+ 69         struct user_namespace *user_ns = current_user_ns();
+ 70         int i;
+ 71         unsigned int count = group_info->ngroups;
+ 72 
+ 73         for (i = 0; i < count; i++) {
+ 74                 gid_t gid;
+ 75                 gid = from_kgid_munged(user_ns, GROUP_AT(group_info, i));
+ 76                 if (put_user(gid, grouplist+i))
+ 77                         return -EFAULT;
+ 78         }
+ 79         return 0;
+ 80 }
+ 81 
+ 82 /* fill a group_info from a user-space array - it must be allocated already */
+ 83 static int groups_from_user(struct group_info *group_info,
+ 84     gid_t __user *grouplist)
+ 85 {
+ 86         struct user_namespace *user_ns = current_user_ns();
+ 87         int i;
+ 88         unsigned int count = group_info->ngroups;
+ 89 
+ 90         for (i = 0; i < count; i++) {
+ 91                 gid_t gid;
+ 92                 kgid_t kgid;
+ 93                 if (get_user(gid, grouplist+i))
+ 94                         return -EFAULT;
+ 95 
+ 96                 kgid = make_kgid(user_ns, gid);
+ 97                 if (!gid_valid(kgid))
+ 98                         return -EINVAL;
+ 99 
+100                 GROUP_AT(group_info, i) = kgid;
+101         }
+102         return 0;
+103 }
+104 
+105 /* a simple Shell sort */
+106 static void groups_sort(struct group_info *group_info)
+107 {
+108         int base, max, stride;
+109         int gidsetsize = group_info->ngroups;
+110 
+111         for (stride = 1; stride < gidsetsize; stride = 3 * stride + 1)
+112                 ; /* nothing */
+113         stride /= 3;
+114 
+115         while (stride) {
+116                 max = gidsetsize - stride;
+117                 for (base = 0; base < max; base++) {
+118                         int left = base;
+119                         int right = left + stride;
+120                         kgid_t tmp = GROUP_AT(group_info, right);
+121 
+122                         while (left >= 0 && gid_gt(GROUP_AT(group_info, left), tmp)) {
+123                                 GROUP_AT(group_info, right) =
+124                                     GROUP_AT(group_info, left);
+125                                 right = left;
+126                                 left -= stride;
+127                         }
+128                         GROUP_AT(group_info, right) = tmp;
+129                 }
+130                 stride /= 3;
+131         }
+132 }
+133 
+134 /* a simple bsearch */
+135 int groups_search(const struct group_info *group_info, kgid_t grp)
+136 {
+137         unsigned int left, right;
+138 
+139         if (!group_info)
+140                 return 0;
+141 
+142         left = 0;
+143         right = group_info->ngroups;
+144         while (left < right) {
+145                 unsigned int mid = (left+right)/2;
+146                 if (gid_gt(grp, GROUP_AT(group_info, mid)))
+147                         left = mid + 1;
+148                 else if (gid_lt(grp, GROUP_AT(group_info, mid)))
+149                         right = mid;
+150                 else
+151                         return 1;
+152         }
+153         return 0;
+154 }
+155 
+156 /**
+157  * set_groups - Change a group subscription in a set of credentials
+158  * @new: The newly prepared set of credentials to alter
+159  * @group_info: The group list to install
+160  */
+161 void set_groups(struct cred *new, struct group_info *group_info)
+162 {
+163         put_group_info(new->group_info);
+164         groups_sort(group_info);
+165         get_group_info(group_info);
+166         new->group_info = group_info;
+167 }
+168 
+169 EXPORT_SYMBOL(set_groups);
+170 
+171 /**
+172  * set_current_groups - Change current's group subscription
+173  * @group_info: The group list to impose
+174  *
+175  * Validate a group subscription and, if valid, impose it upon current's task
+176  * security record.
+177  */
+178 int set_current_groups(struct group_info *group_info)
+179 {
+180         struct cred *new;
+181 
+182         new = prepare_creds();
+183         if (!new)
+184                 return -ENOMEM;
+185 
+186         set_groups(new, group_info);
+187         return commit_creds(new);
+188 }
+189 
+190 EXPORT_SYMBOL(set_current_groups);
+191 
+192 SYSCALL_DEFINE2(getgroups, int, gidsetsize, gid_t __user *, grouplist)
+193 {
+194         const struct cred *cred = current_cred();
+195         int i;
+196 
+197         if (gidsetsize < 0)
+198                 return -EINVAL;
+199 
+200         /* no need to grab task_lock here; it cannot change */
+201         i = cred->group_info->ngroups;
+202         if (gidsetsize) {
+203                 if (i > gidsetsize) {
+204                         i = -EINVAL;
+205                         goto out;
+206                 }
+207                 if (groups_to_user(grouplist, cred->group_info)) {
+208                         i = -EFAULT;
+209                         goto out;
+210                 }
+211         }
+212 out:
+213         return i;
+214 }
+215 
+216 /*
+217  *      SMP: Our groups are copy-on-write. We can set them safely
+218  *      without another task interfering.
+219  */
+220 
+221 SYSCALL_DEFINE2(setgroups, int, gidsetsize, gid_t __user *, grouplist)
+222 {
+223         struct group_info *group_info;
+224         int retval;
+225 
+226         if (!ns_capable(current_user_ns(), CAP_SETGID))
+227                 return -EPERM;
+228         if ((unsigned)gidsetsize > NGROUPS_MAX)
+229                 return -EINVAL;
+230 
+231         group_info = groups_alloc(gidsetsize);
+232         if (!group_info)
+233                 return -ENOMEM;
+234         retval = groups_from_user(group_info, grouplist);
+235         if (retval) {
+236                 put_group_info(group_info);
+237                 return retval;
+238         }
+239 
+240         retval = set_current_groups(group_info);
+241         put_group_info(group_info);
+242 
+243         return retval;
+244 }
+245 
+246 /*
+247  * Check whether we're fsgid/egid or in the supplemental group..
+248  */
+249 int in_group_p(kgid_t grp)
+250 {
+251         const struct cred *cred = current_cred();
+252         int retval = 1;
+253 
+254         if (!gid_eq(grp, cred->fsgid))
+255                 retval = groups_search(cred->group_info, grp);
+256         return retval;
+257 }
+258 
+259 EXPORT_SYMBOL(in_group_p);
+260 
+261 int in_egroup_p(kgid_t grp)
+262 {
+263         const struct cred *cred = current_cred();
+264         int retval = 1;
+265 
+266         if (!gid_eq(grp, cred->egid))
+267                 retval = groups_search(cred->group_info, grp);
+268         return retval;
+269 }
+270 
+271 EXPORT_SYMBOL(in_egroup_p);
